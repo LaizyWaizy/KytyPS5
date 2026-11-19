@@ -5887,8 +5887,21 @@ int main(int argc, char** argv) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	if (argc == 2 && std::strcmp(argv[1], "--tcb-slot-after-host-tls-only") == 0) {
 		constexpr DWORD TEB_TLS_SLOTS = 64;
-		while (TlsAlloc() < TEB_TLS_SLOTS) {
+		DWORD terminal_slot = 0;
+		for (;;) {
+			terminal_slot = TlsAlloc();
+			if (terminal_slot == TLS_OUT_OF_INDEXES) {
+				const DWORD error = GetLastError();
+				std::fprintf(stderr, "Host TLS pressure failed: TlsAlloc returned TLS_OUT_OF_INDEXES "
+				                     "(Win32 error %lu)\n", error);
+				return 1;
+			}
+			if (terminal_slot >= TEB_TLS_SLOTS) {
+				break;
+			}
 		}
+		std::printf("[host]    Host TLS pressure: terminal valid index %lu\n", terminal_slot);
+		std::fflush(stdout);
 		InitSubsystems();
 		RunTest(TestGuestTlsReadsUseThreadTcb);
 		RunTest(TestGuestTlsGetAddrUsesPerThreadBlocks);
