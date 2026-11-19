@@ -52,8 +52,8 @@ static std::wstring HostPath(const std::filesystem::path& path) {
 	constexpr size_t MAX_PLAIN_PATH = 248;
 
 	const auto& native = path.native();
-	if (native.size() < MAX_PLAIN_PATH || native.starts_with(L"\\\\?\\") ||
-	    native.starts_with(L"\\\\.\\")) {
+	if (native.starts_with(L"\\\\?\\") || native.starts_with(L"\\\\.\\") ||
+	    (path.is_absolute() && native.size() < MAX_PLAIN_PATH)) {
 		return native;
 	}
 
@@ -69,6 +69,11 @@ static std::wstring HostPath(const std::filesystem::path& path) {
 			break;
 		}
 		full.resize(size);
+	}
+
+	// A short relative name can resolve to a long path under the current directory.
+	if (native.size() < MAX_PLAIN_PATH && full.size() < MAX_PLAIN_PATH) {
+		return full;
 	}
 
 	if (full.starts_with(L"\\\\")) {

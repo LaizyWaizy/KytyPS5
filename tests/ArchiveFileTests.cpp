@@ -19,6 +19,12 @@
 #include <vector>
 #include <zarchive/zarchivecommon.h>
 
+#if defined(_WIN32)
+#include <windows.h>
+#undef CreateDirectory
+#undef DeleteFile
+#endif
+
 #if !defined(_WIN32) || defined(_GLIBCXX_GCC_GTHR_POSIX_H)
 #include <pthread.h>
 #endif
@@ -303,6 +309,162 @@ void CheckCancellation(const std::filesystem::path &path,
 }
 #endif
 
+#if defined(_WIN32)
+bool CheckRelativeLongHostPaths(const std::filesystem::path &root) {
+  constexpr size_t WorkingDirectoryLength = 230;
+  constexpr std::array<uint8_t, 8> Payload = {0x00, 0x01, 0x7f, 0x80,
+                                              0xff, 0x0a, 0x0d, 0x42};
+  const auto extended = [](const std::filesystem::path &path) {
+    auto native = path.native();
+    std::replace(native.begin(), native.end(), L'/', L'\\');
+    if (native.starts_with(L"\\\\?\\")) {
+      return std::filesystem::path(native);
+    }
+    return std::filesystem::path(native.starts_with(L"\\\\")
+                                     ? L"\\\\?\\UNC\\" + native.substr(2)
+                                     : L"\\\\?\\" + native);
+  };
+  const auto base = root / L"relative";
+  if (base.native().size() > WorkingDirectoryLength ||
+      base.native().size() == WorkingDirectoryLength - 1) {
+    std::fprintf(
+        stderr,
+        "Relative long-path prerequisite FAILED: temporary base has %zu UTF-16 "
+        "units; "
+        "cannot construct a %zu-unit CWD with a nonempty padding component\n",
+        base.native().size(), WorkingDirectoryLength);
+    return false;
+  }
+  const auto original = std::filesystem::current_path();
+  auto working_directory = base;
+  while (WorkingDirectoryLength - working_directory.native().size() > 51) {
+    const auto remaining =
+        WorkingDirectoryLength - working_directory.native().size();
+    working_directory /= std::wstring(remaining == 52 ? 49 : 50, L'w');
+  }
+  if (working_directory.native().size() < WorkingDirectoryLength) {
+    working_directory /= std::wstring(
+        WorkingDirectoryLength - working_directory.native().size() - 1, L'w');
+  }
+  const auto relative =
+      std::filesystem::path(std::wstring(69, L'r')) / L"asset.bin";
+  const auto absolute = working_directory / relative;
+  bool passed = true, cleanup_passed = true;
+  {
+    struct Cleanup {
+      std::filesystem::path original, base;
+      bool &passed;
+      ~Cleanup() {
+        const bool restored = SetCurrentDirectoryW(original.c_str()) != 0;
+        std::error_code cwd_error, remove_error;
+        const bool matches =
+            restored && std::filesystem::current_path(cwd_error) == original &&
+            !cwd_error;
+        std::filesystem::remove_all(base, remove_error);
+        passed = matches && !remove_error;
+        std::printf("Relative long-path cleanup: CWD=%s files=%s\n",
+                    matches ? "restored" : "FAILED",
+                    !remove_error ? "removed" : "FAILED");
+      }
+    } cleanup{original, extended(base), cleanup_passed};
+    const auto record = [&](bool ok, const char *operation,
+                            const char *label = nullptr) {
+      if (!ok) {
+        std::fprintf(stderr, "Relative long-path regression: %s%s%s failed\n",
+                     label ? label : "", label ? ": " : "", operation);
+      }
+      passed = passed && ok;
+      return ok;
+    };
+    const auto write = [&](const std::filesystem::path &path) {
+      Common::File output;
+      if (!record(output.Create(path), "create binary fixture")) {
+        return false;
+      }
+      uint32_t written = 0;
+      output.Write(Payload.data(), static_cast<uint32_t>(Payload.size()),
+                   &written);
+      return record(written == Payload.size(), "write complete binary fixture");
+    };
+    const auto probe = [&](const char *label,
+                           const std::filesystem::path &path) {
+      const auto info = Common::File::GetInfo(path);
+      const bool metadata =
+          record(info && info->is_file && info->size == Payload.size(),
+                 "metadata", label);
+      Common::File input;
+      if (!record(input.Open(path, Common::File::Mode::Read), "open", label)) {
+        return;
+      }
+      std::array<uint8_t, Payload.size()> actual{};
+      actual.fill(0xcc);
+      uint32_t read = 0;
+      input.Read(actual.data(), static_cast<uint32_t>(actual.size()), &read);
+      const bool exact = record(read == Payload.size() && actual == Payload,
+                                "exact binary read", label);
+      std::printf("Relative long-path %s: metadata=%s read=%u exact=%s\n",
+                  label, metadata ? "PASS" : "FAIL", read,
+                  exact ? "PASS" : "FAIL");
+    };
+    std::printf("Relative long-path lengths: CWD=%zu relative=%zu absolute=%zu "
+                "UTF-16 units\n",
+                working_directory.native().size(), relative.native().size(),
+                absolute.native().size());
+    const bool lengths = record(working_directory.native().size() == 230 &&
+                                    relative.native().size() == 79 &&
+                                    absolute.native().size() == 310,
+                                "230/79/310 length assertions");
+    std::error_code setup_error;
+    std::filesystem::create_directories(extended(absolute.parent_path()),
+                                        setup_error);
+    if (setup_error) {
+      std::fprintf(stderr, "Relative long-path fixture setup failed: %s\n",
+                   setup_error.message().c_str());
+      passed = false;
+    }
+    if (lengths && !setup_error && write(extended(absolute)) &&
+        record(SetCurrentDirectoryW(working_directory.c_str()) != 0,
+               "set fixture CWD")) {
+      write(relative);
+      probe("relative", relative);
+      probe("absolute", absolute);
+      probe("extended absolute", extended(absolute));
+      probe("parent traversal", relative.parent_path() / L".." / relative);
+      auto mixed = relative.native();
+      std::replace(mixed.begin(), mixed.end(), L'\\', L'/');
+      probe("mixed separators", std::filesystem::path(L".\\" + mixed));
+      const auto drive = working_directory.root_name().native();
+      if (drive.size() == 2 && drive[1] == L':' &&
+          ((drive[0] >= L'A' && drive[0] <= L'Z') ||
+           (drive[0] >= L'a' && drive[0] <= L'z'))) {
+        probe("drive-relative",
+              std::filesystem::path(drive + relative.native()));
+        probe("root-relative",
+              absolute.root_directory() / absolute.relative_path());
+      } else {
+        std::printf("SKIP drive-relative and root-relative probes: temporary "
+                    "volume has no drive letter\n");
+      }
+      if (write(L".\\short.bin")) {
+        probe("short relative", L".\\short.bin");
+      }
+      Common::File device;
+      record(device.Open(L"\\\\.\\NUL", Common::File::Mode::Read),
+             "device-path open");
+      for (const auto *invalid : {L"", L"invalid?name"}) {
+        record(!Common::File::GetInfo(invalid),
+               "reject empty or invalid path metadata");
+        Common::File input;
+        record(!input.Open(invalid, Common::File::Mode::Read) &&
+                   input.IsInvalid(),
+               "reject empty or invalid path open");
+      }
+    }
+  }
+  return passed && cleanup_passed;
+}
+#endif
+
 } // namespace
 
 int main() {
@@ -327,6 +489,9 @@ int main() {
             !Common::File::GetInfo(temporary.Path() / "missing.bin"),
         "reject missing native paths and files with a trailing separator");
   CheckLongHostPaths(temporary.Path());
+#if defined(_WIN32)
+  Check(CheckRelativeLongHostPaths(temporary.Path()), "relative long-path filesystem access");
+#endif
 
   const auto root = Common::MakeArchivePath(archive_path);
   auto reader_pin = Common::OpenArchive(archive_path);
