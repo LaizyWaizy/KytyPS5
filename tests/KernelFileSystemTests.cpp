@@ -41,6 +41,12 @@
 #include <thread>
 #include <vector>
 
+#if defined(_WIN32)
+#include <windows.h>
+#undef CreateDirectory
+#undef DeleteFile
+#endif
+
 #if defined(__linux__)
 #include <arpa/inet.h>
 #include <ifaddrs.h>
@@ -1412,7 +1418,111 @@ void CheckArchiveMount(const std::filesystem::path &root) {
   Check(FileSystem::KernelClose(fd) == OK, "close last archive descriptor");
 }
 
-void CheckUnicodePaths(const std::filesystem::path &root) {
+#if defined(_WIN32)
+bool CheckWindowsPathLengths(const std::filesystem::path &root) {
+  constexpr std::array<uint8_t, 8> Payload = {
+      0x00, 0x01, 0x7f, 0x80, 0xff, 0x0a, 0x0d, 0x42};
+  const auto extended = [](const std::filesystem::path &path) {
+    auto native = path.native();
+    std::replace(native.begin(), native.end(), L'/', L'\\');
+    return std::filesystem::path(native.starts_with(L"\\\\")
+        ? L"\\\\?\\UNC\\" + native.substr(2) : L"\\\\?\\" + native);
+  };
+  struct Case { const char *label; const wchar_t *name; bool long_path; };
+  bool all_passed = true;
+  for (const auto &test : {Case{"short ASCII", L"sa", false},
+                           Case{"short EN DASH", L"su", false},
+                           Case{"long ASCII", L"la", true},
+                           Case{"long EN DASH", L"lu", true}}) {
+    const auto base = root / test.name;
+    auto directory = base / (test.name[1] == L'u' ? L"game-\u2013-test" : L"game-a-test");
+    if (test.long_path) {
+      while (directory.native().size() + 51 < 300) {
+        directory /= std::wstring(50, L'd');
+      }
+      if (directory.native().size() < 300) {
+        directory /= std::wstring(300 - directory.native().size() - 1, L'd');
+      }
+    }
+    const auto file_path = directory / L"asset.bin";
+    const auto setup_file = extended(file_path);
+    std::printf("CASE %s: directory_units=%zu file_units=%zu (UTF-16, excluding NUL)\n",
+                test.label, directory.native().size(), file_path.native().size());
+    std::printf("PATH %s\n", Common::PathToString(file_path).c_str());
+    const auto record = [&](const char *operation, bool ok, DWORD error) {
+      std::printf("  %s: %s win32_error=%lu (0x%08lx)\n",
+                  operation, ok ? "PASS" : "FAIL", ok ? 0UL : error, ok ? 0UL : error);
+      all_passed = all_passed && ok;
+    };
+
+    SetLastError(ERROR_SUCCESS);
+    const bool directories_created = Common::File::CreateDirectories(directory);
+    const DWORD directory_error = GetLastError();
+    record("plain CreateDirectories", directories_created, directory_error);
+    // Test setup only: ensure later probes have a real fixture even when plain creation fails.
+    std::error_code setup_error;
+    std::filesystem::create_directories(extended(directory), setup_error);
+    Check(!setup_error, "extended-path setup creates the long-path fixture directory");
+
+    Common::File output;
+    SetLastError(ERROR_SUCCESS);
+    const bool created = output.Create(file_path);
+    const DWORD create_error = GetLastError();
+    record("plain Create", created, create_error);
+    if (!created) {
+      Check(output.Create(setup_file), "extended-path setup creates the binary fixture");
+    }
+    uint32_t written = 0;
+    output.Write(Payload.data(), static_cast<uint32_t>(Payload.size()), &written);
+    output.Close();
+    Check(written == Payload.size(), "write deterministic long-path fixture");
+
+    SetLastError(ERROR_SUCCESS);
+    const auto info = Common::File::GetInfo(file_path);
+    const DWORD info_error = GetLastError();
+    record("plain GetInfo", info && info->is_file && info->size == Payload.size(), info_error);
+
+    Common::File input;
+    SetLastError(ERROR_SUCCESS);
+    const bool opened = input.Open(file_path, Common::File::Mode::Read);
+    const DWORD open_error = GetLastError();
+    record("plain Open", opened, open_error);
+    if (opened) {
+      std::array<uint8_t, Payload.size()> actual {};
+      actual.fill(0xcc);
+      uint32_t read = 0;
+      SetLastError(ERROR_SUCCESS);
+      input.Read(actual.data(), static_cast<uint32_t>(actual.size()), &read);
+      const DWORD read_error = GetLastError();
+      input.Close();
+      std::printf("  plain Read: bytes=%u expected=%zu\n", read, Payload.size());
+      record("plain exact read", read == Payload.size() && actual == Payload, read_error);
+    } else {
+      std::printf("  plain Read: NOT REACHED (Open failed)\n");
+    }
+
+    const auto setup_info = Common::File::GetInfo(setup_file);
+    Check(setup_info && setup_info->is_file && setup_info->size == Payload.size(),
+          "extended-path control metadata finds the binary fixture");
+    Common::File control;
+    Check(control.Open(setup_file, Common::File::Mode::Read),
+          "extended-path control opens the binary fixture");
+    std::array<uint8_t, Payload.size()> control_bytes {};
+    uint32_t control_read = 0;
+    control.Read(control_bytes.data(), static_cast<uint32_t>(control_bytes.size()), &control_read);
+    control.Close();
+    Check(control_read == Payload.size() && control_bytes == Payload,
+          "extended-path control reads every binary fixture byte");
+    std::printf("  extended-path fixture control: PASS (metadata, open, exact read)\n");
+    std::error_code cleanup_error;
+    std::filesystem::remove_all(extended(base), cleanup_error);
+    Check(!cleanup_error, "remove long-path fixture through its extended path");
+  }
+  return all_passed;
+}
+#endif
+
+void CheckUnicodePaths(const std::filesystem::path &root, bool report_results = false) {
   constexpr std::string_view HostDirectory =
       "Test\xc3\xa9-\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e";
   constexpr std::string_view GuestFilename =
@@ -1453,6 +1563,48 @@ void CheckUnicodePaths(const std::filesystem::path &root) {
         "close Unicode guest path");
 
   FileSystem::Umount("/app0");
+  if (report_results) {
+    std::printf("PASS: existing Unicode paths, mount root and directory enumeration\n");
+  }
+
+  constexpr std::array<uint8_t, 8> Payload = {
+      0x00, 0x01, 0x7f, 0x80, 0xff, 0x0a, 0x0d, 0x42};
+  constexpr const char *GuestAsset = "/app0/levels/asset.bin";
+  for (const auto &directory : {std::filesystem::path(u8"game-\u2013-test"),
+                                std::filesystem::path("game-ascii-test")}) {
+    const auto host_root = root / directory;
+    const auto host_asset = host_root / "levels" / "asset.bin";
+    Check(Common::File::CreateDirectories(host_asset.parent_path()),
+          "create EN DASH or ASCII control asset directory");
+
+    Common::File asset;
+    Check(asset.Create(host_asset), "create EN DASH or ASCII control asset");
+    uint32_t written = 0;
+    asset.Write(Payload.data(), static_cast<uint32_t>(Payload.size()), &written);
+    asset.Close();
+    Check(written == Payload.size(), "write complete binary asset payload");
+
+    FileSystem::Mount(host_root, "/app0");
+    Check(FileSystem::GetRealFilename(GuestAsset) == host_asset,
+          "resolve asset under EN DASH or ASCII control directory");
+    FileSystem::FileStat stat {};
+    Check(FileSystem::KernelStat(GuestAsset, &stat) == OK &&
+              stat.st_size == Payload.size(),
+          "stat asset under EN DASH or ASCII control directory");
+
+    const int asset_fd = FileSystem::KernelOpen(GuestAsset, 0, 0);
+    Check(asset_fd >= 3, "open asset under EN DASH or ASCII control directory");
+    std::array<uint8_t, Payload.size()> actual {};
+    Check(FileSystem::KernelRead(asset_fd, actual.data(), actual.size()) == actual.size(),
+          "read complete asset under EN DASH or ASCII control directory");
+    Check(actual == Payload, "binary asset payload matches exactly");
+    Check(FileSystem::KernelClose(asset_fd) == OK, "close binary asset");
+    FileSystem::Umount("/app0");
+    if (report_results) {
+      std::printf("PASS: %s: native resolution, stat size=8, open, read=8, exact payload, close\n",
+                  Common::PathToString(directory).c_str());
+    }
+  }
 }
 
 void CheckUnicodeLogPath(const std::filesystem::path &root) {
@@ -1869,6 +2021,114 @@ void CheckAmprOrdering(Loader::SymbolDatabase &symbols, uint32_t file_id) {
         "AMM observes an external CPU fence store without a submission notification");
   for (auto &buffer : buffers) {
     destroy(buffer.header.data());
+  }
+}
+
+void CheckAprUnicodeParentPaths(const std::filesystem::path &root) {
+  Loader::SymbolDatabase symbols;
+  Libs::LibKernelApr::InitLibKernel_1_Apr(&symbols);
+  Libs::LibAmpr::InitAmpr_1(&symbols);
+  const auto find = [&](const char *nid) {
+    const auto *symbol = symbols.FindByNid(nid, Loader::SymbolType::Func);
+    Check(symbol != nullptr, "APR Unicode test export resolves");
+    return symbol->vaddr;
+  };
+  using Resolve = int (KYTY_SYSV_ABI *)(const char *, const char *const *, uint32_t,
+                                      uint32_t *, uint64_t *, uint32_t *);
+  using Stat = int (KYTY_SYSV_ABI *)(uint32_t, FileSystem::FileStat *);
+  using Size = int (KYTY_SYSV_ABI *)(uint32_t, uint64_t *);
+  using Unary = void (KYTY_SYSV_ABI *)(void *);
+  using AprConstructor = void (KYTY_SYSV_ABI *)(void *, void *, void *);
+  using SetBuffer = int (KYTY_SYSV_ABI *)(void *, void *, uint32_t);
+  using ReadFile = int (KYTY_SYSV_ABI *)(void *, uint64_t, uint64_t, uint32_t,
+                                       void *, uint64_t, uint64_t);
+  struct Result { int32_t result; uint32_t error_offset; };
+  using Submit = int (KYTY_SYSV_ABI *)(void *, uint32_t, Result *, uint32_t *);
+  using Wait = int (KYTY_SYSV_ABI *)(uint32_t);
+  const auto resolve = reinterpret_cast<Resolve>(find("w5fcCG+t31g"));
+  const auto stat_file = reinterpret_cast<Stat>(find("ApkYaHb8Sek"));
+  const auto size_file = reinterpret_cast<Size>(find("WvEu7yl3Ivg"));
+  const auto construct = reinterpret_cast<Unary>(find("8aI7R7WaOlc"));
+  const auto construct_apr = reinterpret_cast<AprConstructor>(find("a8uLzYY--tM"));
+  const auto destroy = reinterpret_cast<Unary>(find("GuchCTefuZw"));
+  const auto set_buffer = reinterpret_cast<SetBuffer>(find("N-FSPA4S3nI"));
+  const auto read_file = reinterpret_cast<ReadFile>(find("mQ16-QdKv7k"));
+  const auto submit = reinterpret_cast<Submit>(find("ASoW5WE-UPo"));
+  const auto wait = reinterpret_cast<Wait>(find("rqwFKI4PAiM"));
+
+  constexpr std::array<uint8_t, 8> Payload = {
+      0x00, 0x01, 0x7f, 0x80, 0xff, 0x0a, 0x0d, 0x42};
+  struct Case { std::filesystem::path directory; const char *filename; };
+  // APR caches by guest pathname, so the control uses a distinct filename.
+  for (const auto &test : {Case{std::filesystem::path(u8"game-\u2013-test"), "asset.bin"},
+                           Case{std::filesystem::path("game-ascii-test"), "apr-control.bin"}}) {
+    const auto host_root = root / test.directory;
+    const auto host_file = host_root / "levels" / test.filename;
+    std::printf("APR case: %s/levels/%s\n",
+                Common::PathToString(test.directory).c_str(), test.filename);
+    Check(Common::File::CreateDirectories(host_file.parent_path()),
+          "create APR parent directory");
+    Common::File fixture;
+    Check(fixture.Create(host_file), "create APR binary fixture");
+    uint32_t written = 0;
+    fixture.Write(Payload.data(), static_cast<uint32_t>(Payload.size()), &written);
+    fixture.Close();
+    Check(written == Payload.size(), "write complete APR binary fixture");
+    FileSystem::Mount(host_root, "/app0");
+    const std::string relative = std::string("levels/") + test.filename;
+    const char *path = relative.c_str();
+    uint32_t id = 0xffffffffu, error_index = 0xffffffffu;
+    uint64_t resolved_size = 0;
+    const int resolve_result = resolve("/app0/", &path, 1, &id, &resolved_size, &error_index);
+    std::printf("APR resolve: result=%d id=%u size=%llu error_index=%u\n",
+                resolve_result, id, static_cast<unsigned long long>(resolved_size), error_index);
+    Check(resolve_result == OK && id != 0 && id != 0xffffffffu && resolved_size == Payload.size(),
+          "APR resolves binary fixture to a valid ID and exact size");
+    uint32_t cached_id = 0xffffffffu;
+    uint64_t cached_resolved_size = 0;
+    Check(resolve("/app0/", &path, 1, &cached_id, &cached_resolved_size, &error_index) == OK &&
+              cached_id == id && cached_resolved_size == Payload.size(),
+          "APR cached resolution preserves file ID and size");
+    FileSystem::FileStat stat {};
+    uint64_t size = 0;
+    const int stat_result = stat_file(id, &stat);
+    const int size_result = size_file(id, &size);
+    std::printf("APR metadata: stat=%d size=%lld GetFileSize=%d size=%llu\n",
+                stat_result, static_cast<long long>(stat.st_size), size_result,
+                static_cast<unsigned long long>(size));
+    Check(stat_result == OK && (stat.st_mode & 0170000u) == 0100000u &&
+              stat.st_size == Payload.size() && size_result == OK && size == Payload.size(),
+          "APR metadata and cached GetFileSize report the binary fixture");
+
+    struct Buffer {
+      std::array<uint64_t, 5> header {};
+      std::array<uint32_t, 256> data {};
+    } buffer;
+    construct(buffer.header.data());
+    construct_apr(buffer.header.data(), &buffer.header[3], &buffer.header[4]);
+    Check(set_buffer(buffer.header.data(), buffer.data.data(), sizeof(buffer.data)) == OK,
+          "initialize APR Unicode read command buffer");
+    std::array<uint8_t, Payload.size()> actual {};
+    actual.fill(0xcc);
+    const int append_result = read_file(buffer.header.data(),
+        reinterpret_cast<uint64_t>(&buffer.header[3]),
+        reinterpret_cast<uint64_t>(&buffer.header[4]), id, actual.data(), actual.size(), 0);
+    std::printf("APR append read: result=%d\n", append_result);
+    Check(append_result == OK, "append APR binary fixture read");
+    Result result {1234, 5678};
+    uint32_t submission = 0;
+    const int submit_result = submit(buffer.header.data(), 3, &result, &submission);
+    std::printf("APR submit: result=%d submission=%u\n", submit_result, submission);
+    Check(submit_result == OK, "submit APR binary fixture read");
+    const int wait_result = wait(submission);
+    std::printf("APR completion: wait=%d result=%d error_offset=%u\n",
+                wait_result, result.result, result.error_offset);
+    Check(wait_result == OK && result.result == OK, "complete APR binary fixture read");
+    Check(actual == Payload, "APR read returns every binary payload byte");
+    destroy(buffer.header.data());
+    FileSystem::Umount("/app0");
+    std::printf("PASS: APR %s: resolve, cache, metadata, submitted read, exact payload\n",
+                Common::PathToString(test.directory).c_str());
   }
 }
 
@@ -2888,6 +3148,44 @@ int main(int argc, char** argv) {
   options.printf_direction = Config::LogDirection::Silent;
   Config::Load(options);
   subsystems.Initialize<Log::Lifecycle>();
+
+#if defined(_WIN32)
+  if (argc == 2 && std::string_view(argv[1]) == "--long-path-only") {
+    bool passed = false;
+    {
+      TempDirectory temporary;
+      passed = CheckWindowsPathLengths(temporary.Path());
+    }
+    subsystems.Destroy();
+    std::printf("KernelFileSystemTests: long-path cases %s\n", passed ? "passed" : "failed");
+    return passed ? 0 : 1;
+  }
+#endif
+
+  if (argc == 2 && std::string_view(argv[1]) == "--unicode-only") {
+    Check(SDL_InitSubSystem(SDL_INIT_VIDEO), "initialize Unicode test video");
+    auto graphics = std::make_unique<Libs::Graphics::WindowContext>();
+    graphics->graphic_ctx.screen_width = 64;
+    graphics->graphic_ctx.screen_height = 64;
+    graphics->window = SDL_CreateWindow("UnicodePaths", 64, 64,
+                                      SDL_WINDOW_VULKAN | SDL_WINDOW_HIDDEN);
+    Check(graphics->window != nullptr, "create hidden Unicode test window");
+    graphics->CreateVulkan();
+    {
+      TempDirectory temporary;
+      FileSystem::Initialize();
+      CheckUnicodePaths(temporary.Path(), true);
+      CheckAprUnicodeParentPaths(temporary.Path());
+      CheckUnicodeLogPath(temporary.Path());
+      std::printf("PASS: Unicode log path and exact log contents\n");
+      FileSystem::Shutdown();
+    }
+    graphics.reset();
+    subsystems.Destroy();
+    std::printf("KernelFileSystemTests: Unicode cases passed\n");
+    return 0;
+  }
+
   // Guest threads allocate their TLS in guest memory.
   subsystems.Initialize<Libs::LibKernel::Memory::Lifecycle>();
 
